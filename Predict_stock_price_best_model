@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Nov  5 23:19:18 2022
+
+@author: song
+"""
+
+#1 import packages
+#import torch
+import os
+import time
+import requests
+import sys
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM
+from tensorflow.keras.layers import Dense,Dropout
+from matplotlib import pyplot as plt
+from sklearn.preprocessing import StandardScaler
+import seaborn as sns
+
+from keras.layers import CuDNNLSTM
+from keras.utils.vis_utils import plot_model
+from sklearn.metrics import mean_squared_error
+import random
+from keras.callbacks import EarlyStopping, ModelCheckpoint
+
+#-----------------------------perpare dataset-------------------------------#
+#1.1 read files
+df_RAW = pd.read_excel('/Users/song/Desktop/predict_stock_price/000069.xlsx')
+#deep copy ,create a new object
+df = df_RAW.copy(deep=True)
+df.head()
+
+#1.2 convert datetime string to datetime
+df = df_RAW.copy(deep=True)
+df['dates'] = pd.to_datetime(df['时间'], format='%Y%m%d%H%M%S')
+
+#1.2.1 delet useless  columns 
+df.drop(['Unnamed: 0','时间'],axis='columns',inplace=True)
+
+#1.2.2 change columns names
+df.rename(columns={'收盘价':'close','开盘价':'open','最高价':'max','最低价':'min','成交额（元）':'volume','成交量（手）':'amount'},inplace = True)
+df.head()
+
+#1.3 delete all columns that sum(open,max,min,volumn) = 0
+
+#1.3.1 create a new column
+df['sum'] = df['open']+df['max']+df['min']+df['volume']
+df['sum'].apply(lambda x: int(x))
+# 1.3.2 filter out these rows that 'sum' = 0 and time out of 9.30 and 15.00
+df = df[(df['sum']>0)].set_index('dates').between_time('09:30','15:00').reset_index().drop(['sum'],axis='columns')
+
+#1.4 selet these row that the first timestap of one minutes
+# df['hour']=df['dates'].apply(labmda x: x.hour)
+df = df[df['dates'].dt.second ==0]
+#store date
+date = df['dates'].reset_index().drop(['index'],axis='columns')
+#delete index and date,only keep useful columns
+df = df.reset_index().drop(['index','dates'],axis='columns')
+#-----------------------------------------已处理完毕的数据格式-----------------------------------------#
+#----------------------------------下一步整理数据格式，使其符合LSTM模型-------------------------------------#
+
+#plot close and open price
+import matplotlib.pyplot as plt
+plt.plot(date,df['close'],label='close') #window() rolling.mean
+plt.plot(date,df['open'],label='open')
+plt.legend()
+plt.show()
+
+
+#def scaler data function
+def scaler_data(df_for_training_scaled):
+    scaler = StandardScaler()
+    scaler = scaler.fit(df_for_training_scaled)
+    df_for_training_scaled = scaler.transform(df_for_training_scaled)
+    #return scaled object
+    return df_for_training_scaled,scaler
+
+
+#----------------------------------------reformt dataset function----------------------------------------
+#df_for_training_scaled :scaled dataset,
+#n_futures :how many days to predict 
+#n_past:to predict future price ,how many days we use
+
+def refor_data(df_for_training_scaled,n_futures,n_past):
+    #features and targets
+    trainX = []
+    trainy = []
+    for i in range (n_past, len(df_for_training_scaled) - n_futures - 1):
+#       trainX.append(df_for_training_scaled[i-n_past : i, 1:2])
+#         trainX.append(df_for_training_scaled[i-n_past : i, 1:df_for_training_scaled.shape[1]])
+        trainX.append(df_for_training_scaled[i-n_past : i,:])
+#       the target feature is the first column
+        trainy.append(df_for_training_scaled[i + n_futures -1:i+n_futures,0])
+#       to array
+    trainX, trainy = np.array(trainX),np.array(trainy)
+    return trainX, trainy
+
+#running scaler function
+# df_for_training_scaled,scaler = scaler_data(df)
+
+# #target and features
+# X,y = refor_data(df_for_training_scaled,1,10)
+# print(X.shape,y.shape)
+
+#----------------------------------------def model function to optimise---------------------------------------
+
+
+def lstm_model(units,activation,trainX, trainy):
+    model = Sequential()
+
+    model.add(LSTM(units = units,  activation = activation, dropout=0.4, recurrent_dropout=0.4,input_shape = (trainX.shape[1],trainX.shape[2]), return_sequences=False))
+    
+    model.add(Dropout(rate=0.2))
+#     model.add(Dense(trainy.shape[1]))
+    model.add(Dense(1))
+    
+    model.compile(optimizer ='adam' ,loss='mse')
+
+    model.summary()
+
+    plot_model(model, show_shapes=True, show_layer_names=True)
+    return model
+
+
+#fit function
+def fit_model(trainX, trainy,units,activation,epochs,batch_size,validation_split,round_num):
+    # Set callback functions to early stop training and save the best model so far
+    
+    model_name = 'num_'+str(round_num)+'_paraSet_best_model'+'.h5'
+    # record the best model with 20 epochs patience
+    callbacks = [EarlyStopping(monitor='val_loss', patience=50),ModelCheckpoint(filepath=model_name, monitor='val_loss', save_best_only=True)]
+
+    model = lstm_model(units=units,activation=activation,trainX=trainX, trainy=trainy)
+    history = model.fit(trainX,trainy,epochs=epochs,batch_size=batch_size,validation_split=0.2,verbose =1,callbacks=callbacks)
+    
+    return model ,history
+
+
+# plot loss data
+def plt_loss(history):
+    #fig = plt.figure()
+    his = pd.DataFrame(history.history)
+    his.head(10)
+    his['gap']=his['loss']-his['val_loss']
+    his.sort_values(by = 'gap',ascending=0)
+    
+    
+    plt.plot(history.history['loss'], label='Training loss')
+    plt.plot(history.history['val_loss'], label='Validation loss')
+    plt.legend()
+    plt.show()
+
+# # split train and validation datset
+# split_rate = 0.8
+# split_point = int(len(df)*split_rate)
+# X_train,X_val = X[0:split_point,:],X[split_point:len(df),:]
+# y_train,y_val = y[0:split_point,:],y[split_point:len(df),:]
+
+# train_date,val_date = date[10:split_point],date[split_point:len(df)-1]
+
+
+#function of prediction model
+def pred_result(model,X_val,scaler,y_val,df):
+    prediction = model.predict(X_val) #shape = (n, 1) where n is the n_days_for_prediction
+    prediction_copies = np.repeat(prediction, df.shape[1], axis=-1)
+    #prediction values  real values
+    y_pred_future = scaler.inverse_transform(prediction_copies)[:,0]
+    
+    #inverse real values
+    # print('y_val shape is'+str(y_val.shape))
+    y_val_copy = np.repeat(y_val,df.shape[1],axis=-1)
+    # print('y_val_copy shape is'+str(y_val_copy.shape))
+    y_val_real = scaler.inverse_transform(y_val_copy)[:,0]
+    
+    #plot predict values
+    # plt.plot(date,df['close'],label='real')
+    plt.plot(y_pred_future,label='pred_values')
+    plt.plot(y_val_real,label='real_values')
+    # plt.plot(df.iloc[-688:,1])
+    plt.legend()
+    plt.show()
+
+    #calculate RMSE and print
+    
+    RMSE = mean_squared_error(y_val_real, y_pred_future, squared=True)
+    print('RMSE is: {}'.format(RMSE))
+    
+    return RMSE
+
+# model,history = fit_model(X_train, y_train,64,'relu',100,32,0.2,222)
+# rmse = pred_result(model,X_val,scaler,y_val,df)
+
+
+
+# #-----------------------------------------load my saved model and use it to predict -----------------------------------------#
+# model.load_weights('./num_222_paraSet_best_model.h5')
+# pred_result(model,X_val,scaler,y_val,df)
+#-----------------------------------------已测试模型完毕-----------------------------------------#
+#----------------------------------下一步tunning para，找到最有模型-------------------------------------#
+
+
+#-------------------------------------generate paramater sets-------------------------------------#
+#parameters sets
+def para_set():
+    #1. 6-n_past:[3,7,10,15,30,60]
+    #2. 5-units number :[8,16,32,64,128]
+    #3. 2-activation function:['relu','tanh']
+    #4. 5-epochs:[25,50,100,200,400]
+    #5. 4-bach size:[16,32,64,128]
+    #6. 3-dropout size:[0.1,0.2,0.4]
+    n_past = [3,7,10,15,30,60,120]
+    units = [8,16,32,64,128,256]
+    activation = ['relu','tanh']
+    epochs = [25,50,100,200,400]
+    batch = [16,32,64,128,256]
+    # n_past = [5,10,30,60]
+    # units = [32,64,128]
+    # activation = ['relu']
+    # epochs = [25,50,100,200]
+    # batch = [32,64,128]
+    # n_futures = []
+    num = 0
+    config = list()
+ 
+    for i in units:
+        for j in activation:
+            for k in epochs:
+                for l in batch:
+                    for m in n_past:
+                        num += 1
+                        cof = [num,i,j,k,l,m]
+                        config.append(cof)
+#     print('all configs{}'.format(config))
+    #random serach
+#     random choice 100 parameters set
+#     config = random.choices(config,k=100)
+    return config
+
+
+
+#-------------------------------------running model function-------------------------------------
+#running random search and find the best parameters set
+# changeable parameters
+def run_lstm(round_num,n_past,units, activation, epochs, batch,df):
+    
+    
+    result=[]
+    df_for_training_scaled, scaler = scaler_data(df)
+    
+
+
+    
+    # #reformt dataset
+    # trainX, trainy = refor_data(df_for_training_scaled, n_futures=1, n_past=n_past)
+    # print(trainX.shape,trainy.shape)
+    
+    # split_rate =0.8
+    # split_point = int(len(df)*split_rate)
+    # X_train,X_val = trainX[0:split_point,:],trainX[split_point:len(df),:]
+    # y_train,y_val = trainX[0:split_point,:],trainX[split_point:len(df),:]
+    # #model
+    # print('X_train:{},y_train: {}'.format(X_train.shape,y_train.shape))
+    # model, history = fit_model(X_train, y_train, units=units, activation=activation,
+    #                            epochs=epochs, batch_size=batch, validation_split=0.2,round_num=round_num)
+    
+    
+    
+    #reformt dataset
+    trainX, trainy = refor_data(df_for_training_scaled, n_futures=1, n_past=n_past)
+    #model
+    model, history = fit_model(trainX, trainy, units=units, activation=activation,
+                                epochs=epochs, batch_size=batch, validation_split=0.2,round_num=round_num)
+    
+    split_rate =0.8
+    split_point = int(len(df)*split_rate)
+    X_train,X_val = trainX[0:split_point,:],trainX[split_point:len(df),:]
+    y_train,y_val = trainy[0:split_point,:],trainy[split_point:len(df),:]
+    
+    plt_loss(history)
+    rmse = pred_result(model,X_val,scaler,y_val,df)
+    
+    return rmse,model
+    
+    #predict model
+
+
+#-------------------------------------random_search parameters function-------------------------------------
+def random_search(k):
+    # config = para_set()
+    if k == -1:
+        k = len(para_set())
+    else:
+        k = k
+    config = random.choices(para_set(),k=k)
+    result_lst = []
+    cols_name= ['num','units', 'activation', 'epochs', 'batch', 'n_past','RMSE']
+    for i in range(len(config)):
+        
+        print('config is {}'.format(config[i]))
+
+        num ,units, activation, epochs, batch, n_past = config[i]
+        
+        print('this is the {} round'.format(i))
+        print('params are num_para:{},units:{}, activation:{}, epoch:{}, batch:{}, n_past:{}'.format(num,units, activation, epochs, batch, n_past))
+        RMSE,model = run_lstm(round_num = num,units=units, activation=activation, epochs=epochs, batch=batch, n_past=n_past,df=df)
+        config[i].append(RMSE)
+        result_lst.append(config[i])
+        
+#         result_lst.append(RMSE)
+        
+    
+    result_df = pd.DataFrame(result_lst,columns=cols_name)
+    result_df.sort_values(by=['RMSE'],ascending=False)
+    best = result_df.sort_values(by=['RMSE'],ascending=True)[0:1]
+    
+    print('the best result is \n{}'.format(best) )
+#     print('the best result parameter set is {}'.format(best) )
+    
+    return result_df,model
+
+
+#-------------------------------------get result -------------------------------------
+#数字为测试的参数组个数
+result_df,model = random_search(2)
+#-------------------------------------rank result and get the best model number-------------------------------------
+result_df.sort_values(by=['RMSE'],ascending=True)
+
+#find the best result with the lowet RMSE 
+# we can either load the best model oruse the parameterset to create a best model
+
+
+
+#需要再入模型，做预测的时候用下面的代码
+
+# model_num = result_df.sort_values(by=['RMSE'],ascending=True).iloc[0,0]
+# model_name= './'+'num_'+str(model_num)+'_paraSet_best_model.h5'
+# model.load_weights(model_name)
+
+#model to precdic输入样本shape为（n,m,l）,例如1*5*6,一个样本，前五分钟的数据，六个属性
+# model.predict(X——输入样本)
